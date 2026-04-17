@@ -34,3 +34,4 @@ build/
 
 # Local application overrides
 src/main/resources/application-local.yaml
+/setting.json

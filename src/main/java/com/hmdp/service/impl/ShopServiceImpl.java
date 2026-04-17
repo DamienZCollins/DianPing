@@ -17,12 +17,25 @@ import java.util.concurrent.TimeUnit;
 import static com.hmdp.utils.RedisConstants.CACHE_SHOP_KEY;
 import static com.hmdp.utils.RedisConstants.CACHE_SHOP_TTL;
 import static com.hmdp.utils.RedisConstants.CACHE_NULL_TTL;
+import static com.hmdp.utils.RedisConstants.LOCK_SHOP_KEY;
+import static com.hmdp.utils.RedisConstants.LOCK_SHOP_TTL;
 
 @Service
 public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IShopService {
 
     @Autowired
     private StringRedisTemplate stringRedisTemplate;
+
+    private boolean tryLock(Long id) {
+        String key = LOCK_SHOP_KEY + id;
+        Boolean isLocked = stringRedisTemplate.opsForValue().setIfAbsent(key, "1", LOCK_SHOP_TTL, TimeUnit.SECONDS);
+        return Boolean.TRUE.equals(isLocked);
+    }
+
+    private void unlock(Long id) {
+        String key = LOCK_SHOP_KEY + id;
+        stringRedisTemplate.delete(key);
+    }
 
     @Override
     public Result queryById(Long id) {
@@ -39,16 +52,34 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
         if (shopJson != null) {
             return Result.fail("店铺不存在");
         }
-        // 4.Redis不存在，根据id查询数据库
-        Shop shop = getById(id);
-        // 5.DB不存在，返回404，并将空值写入redis
-        if (shop == null) {
-            stringRedisTemplate.opsForValue().set(key, "", CACHE_NULL_TTL, TimeUnit.MINUTES);
-            return Result.fail("店铺不存在");
+        // 4.实现缓存重建
+        // 4.1 获取互斥锁
+        Shop shop = null;
+        try {
+            boolean isLocked = tryLock(id);
+            // 4.2 判断是否获取成功
+            if (!isLocked) {
+                // 4.3 失败，休眠并重试
+                Thread.sleep(50);
+                return queryById(id);
+            }
+            // 4.4 成功，根据id查询数据库
+            shop = getById(id);
+            // 5.判断数据库是否存在
+            if (shop == null) {
+                // 6.不存在，返回404，并将空值写入redis
+                stringRedisTemplate.opsForValue().set(key, "", CACHE_NULL_TTL, TimeUnit.MINUTES);
+                return Result.fail("店铺不存在");
+            }
+            // 7.存在，写入Redis
+            stringRedisTemplate.opsForValue().set(key, JSONUtil.toJsonStr(shop), CACHE_SHOP_TTL, TimeUnit.MINUTES);
+        } catch (InterruptedException e) {
+            throw new RuntimeException(e);
+        } finally {
+            // 8.释放互斥锁
+            unlock(id);
         }
-        // 6.DB存在，写入Redis
-        stringRedisTemplate.opsForValue().set(key, JSONUtil.toJsonStr(shop), CACHE_SHOP_TTL, TimeUnit.MINUTES);
-        // 7.返回
+        // 9.返回
         return Result.ok(shop);
     }
 

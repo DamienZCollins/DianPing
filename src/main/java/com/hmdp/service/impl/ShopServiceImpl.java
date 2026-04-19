@@ -7,6 +7,8 @@ import com.hmdp.entity.Shop;
 import com.hmdp.mapper.ShopMapper;
 import com.hmdp.service.IShopService;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
+import org.redisson.api.RLock;
+import org.redisson.api.RedissonClient;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
@@ -26,61 +28,60 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
     @Autowired
     private StringRedisTemplate stringRedisTemplate;
 
-    private boolean tryLock(Long id) {
-        String key = LOCK_SHOP_KEY + id;
-        Boolean isLocked = stringRedisTemplate.opsForValue().setIfAbsent(key, "1", LOCK_SHOP_TTL, TimeUnit.SECONDS);
-        return Boolean.TRUE.equals(isLocked);
-    }
-
-    private void unlock(Long id) {
-        String key = LOCK_SHOP_KEY + id;
-        stringRedisTemplate.delete(key);
-    }
+    @Autowired
+    private RedissonClient redissonClient;
 
     @Override
     public Result queryById(Long id) {
         String key = CACHE_SHOP_KEY + id;
         // 1.从Redis查询商铺缓存
         String shopJson = stringRedisTemplate.opsForValue().get(key);
-        // 2.判断是否存在
+        // 2.命中有效值
         if (StrUtil.isNotBlank(shopJson)) {
-            // 3.存在，直接返回
-            Shop shop = JSONUtil.toBean(shopJson, Shop.class);
-            return Result.ok(shop);
+            return Result.ok(JSONUtil.toBean(shopJson, Shop.class));
         }
-        // 判断命中的是否是空值
+        // 3.命中空值（防穿透）
         if (shopJson != null) {
             return Result.fail("店铺不存在");
         }
-        // 4.实现缓存重建
-        // 4.1 获取互斥锁
-        Shop shop = null;
+        // 4.缓存重建：基于 Redisson 分布式互斥锁
+        RLock lock = redissonClient.getLock(LOCK_SHOP_KEY + id);
+        boolean isLock = false;
         try {
-            boolean isLocked = tryLock(id);
-            // 4.2 判断是否获取成功
-            if (!isLocked) {
-                // 4.3 失败，休眠并重试
+            // 4.1 非阻塞抢锁，持有期 = LOCK_SHOP_TTL 秒，避免持锁线程崩溃导致长期死锁
+            isLock = lock.tryLock(0, LOCK_SHOP_TTL, TimeUnit.SECONDS);
+            if (!isLock) {
+                // 4.2 抢锁失败：短暂休眠后重试，等待赢家完成重建
                 Thread.sleep(50);
                 return queryById(id);
             }
-            // 4.4 成功，根据id查询数据库
-            shop = getById(id);
-            // 5.判断数据库是否存在
+            // 4.3 双重检查：拿到锁后再查一次缓存，避免重复回源
+            shopJson = stringRedisTemplate.opsForValue().get(key);
+            if (StrUtil.isNotBlank(shopJson)) {
+                return Result.ok(JSONUtil.toBean(shopJson, Shop.class));
+            }
+            if (shopJson != null) {
+                return Result.fail("店铺不存在");
+            }
+            // 4.4 回源数据库
+            Shop shop = getById(id);
             if (shop == null) {
-                // 6.不存在，返回404，并将空值写入redis
+                // 写入空值防穿透
                 stringRedisTemplate.opsForValue().set(key, "", CACHE_NULL_TTL, TimeUnit.MINUTES);
                 return Result.fail("店铺不存在");
             }
             // 7.存在，写入Redis
             stringRedisTemplate.opsForValue().set(key, JSONUtil.toJsonStr(shop), CACHE_SHOP_TTL, TimeUnit.MINUTES);
+            return Result.ok(shop);
         } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
             throw new RuntimeException(e);
         } finally {
-            // 8.释放互斥锁
-            unlock(id);
+            // 仅在持锁成功时释放，避免 Redisson 抛 IllegalMonitorStateException
+            if (isLock && lock.isHeldByCurrentThread()) {
+                lock.unlock();
+            }
         }
-        // 9.返回
-        return Result.ok(shop);
     }
 
     @Override

@@ -7,13 +7,17 @@ import com.hmdp.mapper.VoucherOrderMapper;
 import com.hmdp.service.ISeckillVoucherService;
 import com.hmdp.service.IVoucherOrderService;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
+import com.hmdp.utils.ILock;
 import com.hmdp.utils.RedisIdWorker;
+import com.hmdp.utils.SimpleRedisLock;
 import com.hmdp.utils.UserHolder;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.time.LocalDateTime;
+import java.util.concurrent.TimeUnit;
 
 /**
  * <p>
@@ -34,6 +38,9 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
 
     @Autowired
     private IVoucherOrderService self;
+
+    @Autowired
+    private StringRedisTemplate stringRedisTemplate;
 
     @Override
     public Result seckillVoucher(Long voucherId) {
@@ -60,13 +67,26 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
     @Transactional
     public Result createVoucherOrder(Long voucherId) {
         Long userId = UserHolder.getUser().getId();
-        synchronized (userId.toString().intern()) {
-            // 5.1.一人一单校验
-            int count = query().eq("voucher_id", voucherId).eq("user_id", userId).count();
-            if (count > 0) {
+        ILock lock = new SimpleRedisLock("order:" + userId, stringRedisTemplate);
+        boolean isLock = lock.tryLock(5);
+        if (!isLock) {
+            return Result.fail("不允许重复下单！");
+        }
+        try {
+            // 5.1.一人一单校验（先查Redis缓存）
+            String cacheKey = "order:" + voucherId + ":" + userId;
+            Boolean isPurchased = stringRedisTemplate.hasKey(cacheKey);
+            if (Boolean.TRUE.equals(isPurchased)) {
                 return Result.fail("用户已经购买过一次！");
             }
-            // 6.扣减库存
+            // 5.2.缓存未命中，查数据库
+            int count = query().eq("voucher_id", voucherId).eq("user_id", userId).count();
+            if (count > 0) {
+                // 缓存购买记录，TTL设置为优惠券结束时间
+                stringRedisTemplate.opsForValue().set(cacheKey, "1", 24, TimeUnit.HOURS);
+                return Result.fail("用户已经购买过一次！");
+            }
+            // 6.扣减库存（乐观锁）
             boolean success = seckillVoucherService.update()
                     .setSql("stock = stock - 1")
                     .eq("voucher_id", voucherId)
@@ -85,8 +105,12 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
             // 7.3.优惠券ID
             voucherOrder.setVoucherId(voucherId);
             save(voucherOrder);
+            // 7.4.缓存购买记录
+            stringRedisTemplate.opsForValue().set(cacheKey, "1", 24, TimeUnit.HOURS);
             // 8.返回订单ID
             return Result.ok(orderId);
+        } finally {
+            lock.unlock();
         }
     }
 }

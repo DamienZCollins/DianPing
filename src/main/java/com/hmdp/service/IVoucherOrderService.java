@@ -22,9 +22,10 @@ public interface IVoucherOrderService extends IService<VoucherOrder> {
     Result seckillVoucher(Long voucherId);
 
     /**
-     * 创建订单（事务方法）
-     * @param voucherId 优惠券ID
-     * @return 订单ID
+     * 异步消费：把已经通过 Redis 资格判定的订单写入数据库。
+     * 由后台消费线程通过 AOP 代理调用，事务边界在此方法。
+     *
+     * @param voucherOrder 已经在生产者侧填好 id/userId/voucherId 的订单
      */
-    Result createVoucherOrder(Long voucherId);
+    void createVoucherOrder(VoucherOrder voucherOrder);
 }
